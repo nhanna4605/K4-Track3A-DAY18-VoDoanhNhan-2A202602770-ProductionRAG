@@ -21,6 +21,9 @@ from config import RERANK_TOP_K
 # nhưng gửi đoạn CHA cho LLM (đủ ngữ cảnh) — đúng thiết kế Hierarchical của M1.
 PARENT_TEXTS: dict[tuple[str, str], str] = {}
 
+# Thời gian từng bước (giây) và từng truy vấn (ms) -> reports/latency_report.json
+TIMINGS: dict = {"steps_s": {}, "query_ms": {"search": [], "rerank": [], "llm": []}}
+
 
 def build_pipeline():
     """Build production RAG pipeline."""
@@ -40,12 +43,14 @@ def build_pipeline():
             PARENT_TEXTS[(doc["metadata"]["source"], parent.metadata["parent_id"])] = parent.text
         for child in children:
             all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
+    TIMINGS["steps_s"]["1_chunking"] = round(time.time() - t0, 2)
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 2: Enrichment (M5)
     t0 = time.time()
     print(f"\n[2/4] Enriching {len(all_chunks)} chunks (M5, 1 API call/chunk)...", flush=True)
     enriched = enrich_chunks(all_chunks)
+    TIMINGS["steps_s"]["2_enrichment"] = round(time.time() - t0, 2)
     if enriched:
         all_chunks = [{"text": e.enriched_text, "metadata": e.auto_metadata} for e in enriched]
         print(f"  ✓ Enriched {len(enriched)} chunks ({time.time()-t0:.1f}s)", flush=True)
@@ -57,12 +62,14 @@ def build_pipeline():
     print(f"\n[3/4] Indexing {len(all_chunks)} chunks (BM25 + Dense)...", flush=True)
     search = HybridSearch()
     search.index(all_chunks)
+    TIMINGS["steps_s"]["3_indexing"] = round(time.time() - t0, 2)
     print(f"  ✓ Indexed ({time.time()-t0:.1f}s)", flush=True)
 
     # Step 4: Reranker (M3)
     t0 = time.time()
     print("\n[4/4] Loading reranker...", flush=True)
     reranker = CrossEncoderReranker()
+    TIMINGS["steps_s"]["4_reranker_load"] = round(time.time() - t0, 2)
     print(f"  ✓ Reranker ready ({time.time()-t0:.1f}s)", flush=True)
 
     return search, reranker
@@ -70,9 +77,14 @@ def build_pipeline():
 
 def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
     """Run single query through pipeline."""
+    t0 = time.perf_counter()
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
+    t1 = time.perf_counter()
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
+    t2 = time.perf_counter()
+    TIMINGS["query_ms"]["search"].append((t1 - t0) * 1000)
+    TIMINGS["query_ms"]["rerank"].append((t2 - t1) * 1000)
     contexts = []
     for r in (reranked if reranked else results[:RERANK_TOP_K]):
         key = (r.metadata.get("source"), r.metadata.get("parent_id"))
@@ -81,6 +93,7 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             contexts.append(text)
 
     from config import OPENAI_API_KEY
+    t3 = time.perf_counter()
     if OPENAI_API_KEY and contexts:
         try:
             from openai import OpenAI
@@ -96,6 +109,7 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
             answer = contexts[0]
     else:
         answer = contexts[0] if contexts else "Không tìm thấy thông tin."
+    TIMINGS["query_ms"]["llm"].append((time.perf_counter() - t3) * 1000)
     return answer, contexts
 
 
@@ -127,7 +141,25 @@ def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
 
     failures = failure_analysis(results.get("per_question", []))
     save_report(results, failures)
+    _save_details(results.get("per_question", []))
     return results
+
+
+def _save_details(per_question) -> None:
+    """Lưu điểm + câu trả lời + ngữ cảnh từng câu (phục vụ failure analysis) và bảng latency."""
+    import json
+    from dataclasses import asdict
+
+    os.makedirs("reports", exist_ok=True)
+    with open("reports/ragas_details.json", "w", encoding="utf-8") as f:
+        json.dump([asdict(r) for r in per_question], f, ensure_ascii=False, indent=2)
+
+    q = TIMINGS["query_ms"]
+    avg = {k: round(sum(v) / len(v), 1) if v else 0.0 for k, v in q.items()}
+    report = {"steps_s": TIMINGS["steps_s"], "avg_query_ms": avg, "num_queries": len(q["search"])}
+    with open("reports/latency_report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    print(f"  Latency/query (ms): {avg} · steps (s): {TIMINGS['steps_s']}")
 
 
 if __name__ == "__main__":

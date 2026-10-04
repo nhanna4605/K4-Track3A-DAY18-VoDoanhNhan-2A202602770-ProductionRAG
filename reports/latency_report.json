@@ -1,0 +1,14 @@
+{
+  "steps_s": {
+    "1_chunking": 0.22,
+    "2_enrichment": 424.27,
+    "3_indexing": 60.47,
+    "4_reranker_load": 0.0
+  },
+  "avg_query_ms": {
+    "search": 247.6,
+    "rerank": 11513.2,
+    "llm": 2359.5
+  },
+  "num_queries": 20
+}
