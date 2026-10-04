@@ -17,6 +17,10 @@ from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_re
 from src.m5_enrichment import enrich_chunks
 from config import RERANK_TOP_K
 
+# (source, parent_id) -> văn bản đoạn cha. Tìm kiếm khớp trên đoạn CON (chính xác),
+# nhưng gửi đoạn CHA cho LLM (đủ ngữ cảnh) — đúng thiết kế Hierarchical của M1.
+PARENT_TEXTS: dict[tuple[str, str], str] = {}
+
 
 def build_pipeline():
     """Build production RAG pipeline."""
@@ -29,8 +33,11 @@ def build_pipeline():
     print("\n[1/4] Chunking documents...", flush=True)
     docs = load_documents()
     all_chunks = []
+    PARENT_TEXTS.clear()
     for doc in docs:
         parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
+        for parent in parents:
+            PARENT_TEXTS[(doc["metadata"]["source"], parent.metadata["parent_id"])] = parent.text
         for child in children:
             all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
     print(f"  ✓ {len(all_chunks)} chunks from {len(docs)} documents ({time.time()-t0:.1f}s)", flush=True)
@@ -66,7 +73,12 @@ def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) 
     results = search.search(query)
     docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
     reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    contexts = []
+    for r in (reranked if reranked else results[:RERANK_TOP_K]):
+        key = (r.metadata.get("source"), r.metadata.get("parent_id"))
+        text = PARENT_TEXTS.get(key, r.text)  # đoạn cha nếu có, ngược lại giữ đoạn con
+        if text not in contexts:  # nhiều đoạn con có thể cùng một cha
+            contexts.append(text)
 
     from config import OPENAI_API_KEY
     if OPENAI_API_KEY and contexts:
